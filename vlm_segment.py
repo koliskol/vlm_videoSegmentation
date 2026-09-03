@@ -101,6 +101,65 @@ def _recaption_full_span(session: vlm_label.VlmSession, segments: list[ActionSeg
         )
 
 
+def merge_similar_neighbors(
+    session: vlm_label.VlmSession,
+    segments: list[ActionSegment],
+    progress_cb: Optional[Callable[[float, int, int], None]] = None,
+) -> list[ActionSegment]:
+    """Second consolidation pass over already-divided, already-recaptioned
+    segments: walk neighbors in order and ask the VLM -- visually, on the
+    next segment's own footage, same grounded mechanism as the original
+    divide step -- whether it's still the SAME action as the previous
+    (already-merged) segment's caption. A "yes" merges them; a "no" keeps
+    them separate.
+
+    Why this is a separate pass rather than just using a smaller step size
+    in segment_by_action: the divide step's tiny 2-4 frame / 160px windows
+    are tuned to be sensitive to change, which means they can also be
+    over-sensitive -- splitting what's really one continuous action into
+    several pieces because two adjacent slivers looked different enough by
+    themselves. This pass compares against the FULL-SPAN, higher-resolution
+    recaptioned label instead of a tiny window's guess, so it's a more
+    reliable "are these actually the same action" judgment -- and only
+    costs one VLM call per neighbor pair, not a full re-divide.
+
+    Only genuinely-merged segments are recaptioned afterward; segments that
+    never got merged with anything keep their already-good label instead of
+    paying for a redundant caption call."""
+    if len(segments) <= 1:
+        return segments
+
+    merged = [segments[0]]
+    was_merged = [False]
+    n = len(segments)
+
+    for i in range(1, n):
+        if progress_cb:
+            progress_cb(i / max(n - 1, 1), i + 1, n)
+
+        seg = segments[i]
+        last = merged[-1]
+        question = SAME_ACTION_QUESTION_TEMPLATE.format(anchor_caption=last.label)
+        answer = vlm_label.classify_clip(
+            session, seg.start_t, seg.end_t, question, SAME_ACTION_CHOICES,
+            fps=vlm_label.LABEL_FPS, max_frames=vlm_label.LABEL_MAX_FRAMES,
+            video_path=session.small_video_path,
+        )
+
+        if answer == "YES":
+            merged[-1] = ActionSegment(label=last.label, start_t=last.start_t, end_t=seg.end_t)
+            was_merged[-1] = True
+        else:
+            merged.append(seg)
+            was_merged.append(False)
+
+    to_recaption = [s for s, m in zip(merged, was_merged) if m]
+    if to_recaption:
+        _recaption_full_span(session, to_recaption)
+
+    return merged
+
+
 def segment_by_action(
     session: vlm_label.VlmSession,
     duration_s: float,

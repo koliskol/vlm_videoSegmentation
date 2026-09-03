@@ -60,25 +60,7 @@ def _video_duration_s(video_path: str) -> float:
     return float(data["format"]["duration"])
 
 
-def segment_fn(video_path, vlm_session, frames_per_window, step_frames, progress=gr.Progress()):
-    if not video_path:
-        raise gr.Error("Upload a video first.")
-
-    duration_s = _video_duration_s(video_path)
-    if duration_s <= 0:
-        raise gr.Error("Could not read this video's duration.")
-
-    if vlm_session is None or vlm_session.source_video_path != video_path:
-        progress(0, desc="Loading VideoLLaMA3-2B (first time only, ~5GB VRAM)...")
-        vlm_session = vlm_label.load_session(video_path, duration_s, existing=vlm_session)
-
-    def cb(frac, i, n):
-        progress(frac, desc=f"Classifying window {i}/{n}")
-
-    segments = vlm_segment.segment_by_action(
-        vlm_session, duration_s, int(frames_per_window), int(step_frames), progress_cb=cb,
-    )
-
+def _build_outputs(video_path, segments, duration_s, out_dir_name):
     rows = []
     total_index = 0
     for i, s in enumerate(segments):
@@ -105,10 +87,54 @@ def segment_fn(video_path, vlm_session, frames_per_window, step_frames, progress
         f"certified predetermined-time standard. See README.md."
     )
 
-    out_dir = os.path.join(tempfile.gettempdir(), "vlm_action_clips")
+    out_dir = os.path.join(tempfile.gettempdir(), out_dir_name)
     gallery_items = viz_clips.export_action_clips(video_path, segments, out_dir)
 
-    return vlm_session, summary, df, gallery_items
+    return summary, df, gallery_items
+
+
+def segment_fn(video_path, vlm_session, frames_per_window, step_frames, progress=gr.Progress()):
+    if not video_path:
+        raise gr.Error("Upload a video first.")
+
+    duration_s = _video_duration_s(video_path)
+    if duration_s <= 0:
+        raise gr.Error("Could not read this video's duration.")
+
+    if vlm_session is None or vlm_session.source_video_path != video_path:
+        progress(0, desc="Loading VideoLLaMA3-2B (first time only, ~5GB VRAM)...")
+        vlm_session = vlm_label.load_session(video_path, duration_s, existing=vlm_session)
+
+    def cb(frac, i, n):
+        progress(frac, desc=f"Classifying window {i}/{n}")
+
+    segments = vlm_segment.segment_by_action(
+        vlm_session, duration_s, int(frames_per_window), int(step_frames), progress_cb=cb,
+    )
+    summary, df, gallery_items = _build_outputs(video_path, segments, duration_s, "vlm_action_clips_step1")
+    summary += "\n\nNow run **2. Merge similar neighboring segments** if you want to consolidate over-split segments."
+    return vlm_session, segments, summary, df, gallery_items
+
+
+def merge_fn(video_path, vlm_session, segments, progress=gr.Progress()):
+    if not segments:
+        raise gr.Error("Run '1. Segment by VLM action recognition' first.")
+    if vlm_session is None:
+        raise gr.Error("VLM session missing — run step 1 again.")
+
+    duration_s = _video_duration_s(video_path)
+
+    def cb(frac, i, n):
+        progress(frac, desc=f"Comparing neighbor {i}/{n}")
+
+    merged = vlm_segment.merge_similar_neighbors(vlm_session, segments, progress_cb=cb)
+    n_merged = len(segments) - len(merged)
+    summary, df, gallery_items = _build_outputs(video_path, merged, duration_s, "vlm_action_clips_step2")
+    summary = (
+        f"**Merged {n_merged} pair(s)** of neighboring segments judged the "
+        f"same action ({len(segments)} → {len(merged)} segments).\n\n" + summary
+    )
+    return merged, summary, df, gallery_items
 
 
 METHODOLOGY_MD = """
@@ -181,6 +207,7 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
     )
 
     vlm_state = gr.State(None)
+    segments_state = gr.State(None)
 
     with gr.Tab("Segment"):
         with gr.Row():
@@ -188,7 +215,7 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
                 video_in = gr.Video(label="Video", sources=["upload"])
                 frames_per_window_slider = gr.Slider(2, 12, value=vlm_segment.FRAMES_PER_WINDOW, step=1, label="Frames per window")
                 step_frames_slider = gr.Slider(1, 12, value=vlm_segment.STEP_FRAMES, step=1, label="Slide step (frames)")
-                segment_btn = gr.Button("Segment by VLM action recognition", variant="primary")
+                segment_btn = gr.Button("1. Segment by VLM action recognition", variant="primary")
                 gr.Markdown(
                     "_Frames are sampled at 5/s (so 10 frames ≈ 2s of "
                     "footage). **12 is the tested-safe ceiling on a 12GB "
@@ -199,6 +226,17 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
                     "(~5GB VRAM, a few seconds); later clicks with a "
                     "different video reuse the loaded model and only "
                     "regenerate the small resized copies._"
+                )
+                merge_btn = gr.Button("2. Merge similar neighboring segments")
+                gr.Markdown(
+                    "_Second pass: for each pair of neighboring segments, "
+                    "shows the model the later segment's own footage and "
+                    "asks whether it's still the same action as the earlier "
+                    "segment's (already full-span, higher-resolution) "
+                    "caption — grounded in footage, not text similarity. "
+                    "This is conservative by design: two segments with "
+                    "near-identical captions won't merge if the model still "
+                    "sees a difference when actually shown both clips._"
                 )
             with gr.Column(scale=2):
                 summary_md = gr.Markdown()
@@ -216,7 +254,13 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
     segment_btn.click(
         segment_fn,
         inputs=[video_in, vlm_state, frames_per_window_slider, step_frames_slider],
-        outputs=[vlm_state, summary_md, segments_df, clips_gallery],
+        outputs=[vlm_state, segments_state, summary_md, segments_df, clips_gallery],
+    )
+
+    merge_btn.click(
+        merge_fn,
+        inputs=[video_in, vlm_state, segments_state],
+        outputs=[segments_state, summary_md, segments_df, clips_gallery],
     )
 
 
