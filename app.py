@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import tempfile
+import uuid
 
 import gradio as gr
 import pandas as pd
@@ -22,6 +24,28 @@ import most_index as mi
 import viz_clips
 import vlm_label
 import vlm_segment
+
+
+def sanitize_video_fn(video_path):
+    """Copy an uploaded video to a randomized, ASCII-safe filename.
+
+    Why: Gradio serves uploaded files by URL, and a filename containing '#'
+    breaks that -- '#' starts a URL fragment, so everything after it gets
+    silently dropped from the requested path, and the browser reports the
+    video as unplayable even though the file itself is perfectly valid.
+    (Confirmed: a file named "...Seconds! #worker #process....mp4" failed
+    to play; an identical copy under a plain name played fine.) Rather than
+    trying to whitelist "safe" characters -- there's always another one,
+    emoji and non-Latin scripts included -- every upload gets a fresh
+    uuid-based name, sidestepping the whole class of problem."""
+    if not video_path:
+        return None
+    ext = os.path.splitext(video_path)[1] or ".mp4"
+    safe_dir = os.path.join(tempfile.gettempdir(), "vlm_seg_uploads")
+    os.makedirs(safe_dir, exist_ok=True)
+    safe_path = os.path.join(safe_dir, f"upload_{uuid.uuid4().hex}{ext}")
+    shutil.copy2(video_path, safe_path)
+    return safe_path
 
 
 def _video_duration_s(video_path: str) -> float:
@@ -186,6 +210,8 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
 
     with gr.Tab("Methodology & limitations"):
         gr.Markdown(METHODOLOGY_MD)
+
+    video_in.upload(sanitize_video_fn, inputs=[video_in], outputs=[video_in])
 
     segment_btn.click(
         segment_fn,
