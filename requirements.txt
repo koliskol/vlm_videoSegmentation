@@ -1,0 +1,16 @@
+# Tested combination -- see README.md "Setup" for why transformers is
+# pinned below 5.x (VideoLLaMA3's custom modeling code uses an API removed
+# in transformers 5) and why the resulting huggingface_hub pip warning is
+# expected and harmless.
+torch==2.6.0
+torchvision==0.21.0
+transformers==4.49.0
+accelerate==1.14.0
+einops==0.8.2
+timm==1.0.29
+sentencepiece==0.2.2
+ffmpeg-python==0.2.0
+imageio==2.37.4
+imageio-ffmpeg==0.6.0
+gradio>=5.0,<7.0
+pandas>=2.0

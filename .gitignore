@@ -1,0 +1,25 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Videos and generated clips -- not source, and can be large
+*.mp4
+*.mov
+*.avi
+*.mkv
+!**/sample_media/**
+
+# Gradio / model caches (VideoLLaMA3 weights download to ~/.cache/huggingface,
+# outside this repo, but local overrides sometimes end up here)
+flagged/
+gradio_cached_examples/
+
+# OS
+.DS_Store
