@@ -107,21 +107,35 @@ def merge_similar_neighbors(
     progress_cb: Optional[Callable[[float, int, int], None]] = None,
 ) -> list[ActionSegment]:
     """Second consolidation pass over already-divided, already-recaptioned
-    segments: walk neighbors in order and ask the VLM -- visually, on the
-    next segment's own footage, same grounded mechanism as the original
-    divide step -- whether it's still the SAME action as the previous
-    (already-merged) segment's caption. A "yes" merges them; a "no" keeps
-    them separate.
+    segments: walk neighbors in order and ask the VLM -- via a TEXT-only
+    comparison of the two segments' already-generated captions, not by
+    re-watching footage -- whether they describe the SAME action. A "yes"
+    merges them; a "no" keeps them separate.
+
+    Why compare captions instead of re-grounding in footage a second time
+    (an earlier version of this function did that, the same way the divide
+    step's YES/NO check works): on low-motion/visually-ambiguous content --
+    e.g. two clips that both just show someone standing still -- re-showing
+    the model footage produced inconsistent, unreliable "different" verdicts
+    even when the two segments' full-span captions were IDENTICAL text.
+    We already trust those captions (they came from a full-span, higher-
+    resolution pass), so comparing them directly is both cheaper (no video
+    processing at all) and more reliable than asking the model to
+    re-discriminate between two clips that may carry very little visual
+    signal to begin with.
+
+    NOTE: this only ever merges ADJACENT segments, by design -- if the same
+    action recurs later with something different in between (A, B, A), the
+    two A's stay separate rather than merging, since merging means
+    extending one contiguous time range and a non-adjacent "same caption"
+    would wrongly swallow whatever sits between them.
 
     Why this is a separate pass rather than just using a smaller step size
     in segment_by_action: the divide step's tiny 2-4 frame / 160px windows
     are tuned to be sensitive to change, which means they can also be
     over-sensitive -- splitting what's really one continuous action into
     several pieces because two adjacent slivers looked different enough by
-    themselves. This pass compares against the FULL-SPAN, higher-resolution
-    recaptioned label instead of a tiny window's guess, so it's a more
-    reliable "are these actually the same action" judgment -- and only
-    costs one VLM call per neighbor pair, not a full re-divide.
+    themselves.
 
     Only genuinely-merged segments are recaptioned afterward; segments that
     never got merged with anything keep their already-good label instead of
@@ -139,12 +153,7 @@ def merge_similar_neighbors(
 
         seg = segments[i]
         last = merged[-1]
-        question = SAME_ACTION_QUESTION_TEMPLATE.format(anchor_caption=last.label)
-        answer = vlm_label.classify_clip(
-            session, seg.start_t, seg.end_t, question, SAME_ACTION_CHOICES,
-            fps=vlm_label.LABEL_FPS, max_frames=vlm_label.LABEL_MAX_FRAMES,
-            video_path=session.small_video_path,
-        )
+        answer = vlm_label.compare_captions(session, last.label, seg.label)
 
         if answer == "YES":
             merged[-1] = ActionSegment(label=last.label, start_t=last.start_t, end_t=seg.end_t)

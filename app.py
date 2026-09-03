@@ -167,6 +167,18 @@ METHODOLOGY_MD = """
    capability ceiling, not a prompt-wording problem — we tried several
    more elaborate prompts and they made it worse (the model either went
    silent or collapsed into repeating one fixed word for every window).
+6. **Merge pass (optional, step 2)**: steps 1-5 can still over-segment —
+   the tiny comparison windows in step 3 are tuned to be sensitive to
+   change, so two adjacent segments can end up split even when a human
+   would call them the same action. This pass compares each neighboring
+   pair's *already-generated captions* directly, as plain text, no video
+   involved — cheaper than, and for low-motion/ambiguous footage more
+   reliable than, re-examining clips a second time (an earlier version did
+   that and gave inconsistent verdicts on nearly-static content). It only
+   ever merges *adjacent* segments; a repeated action with something
+   different sandwiched between two occurrences stays separate, since
+   merging means extending one contiguous time range and bridging a gap
+   would misrepresent what's actually in between.
 
 ## What this is not
 
@@ -230,13 +242,12 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
                 merge_btn = gr.Button("2. Merge similar neighboring segments")
                 gr.Markdown(
                     "_Second pass: for each pair of neighboring segments, "
-                    "shows the model the later segment's own footage and "
-                    "asks whether it's still the same action as the earlier "
-                    "segment's (already full-span, higher-resolution) "
-                    "caption — grounded in footage, not text similarity. "
-                    "This is conservative by design: two segments with "
-                    "near-identical captions won't merge if the model still "
-                    "sees a difference when actually shown both clips._"
+                    "asks the model — via a text-only comparison of their "
+                    "already-generated captions, no video re-examined — "
+                    "whether they describe the same action. Only merges "
+                    "adjacent segments: a repeated action with something "
+                    "different in between stays separate rather than "
+                    "wrongly bridging the gap between them._"
                 )
             with gr.Column(scale=2):
                 summary_md = gr.Markdown()

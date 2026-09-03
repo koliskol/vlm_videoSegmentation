@@ -94,6 +94,37 @@ def load_session(video_path: str, video_duration_s: float, existing: "VlmSession
     )
 
 
+SAME_CAPTION_QUESTION_TEMPLATE = (
+    'Do these two descriptions refer to the SAME physical action? '
+    'A: "{caption_a}"  B: "{caption_b}" '
+    'Answer with exactly one word: YES or NO.'
+)
+
+
+def compare_captions(session: VlmSession, caption_a: str, caption_b: str) -> "str | None":
+    """Text-only comparison (no video attached) of two already-generated
+    captions. Cheaper than, and for low-motion/visually-ambiguous content
+    (e.g. two clips that both just show someone standing still) more
+    reliable than, re-grounding the judgment in footage a second time --
+    we already trust these captions, they came from a full-span,
+    higher-resolution pass (see vlm_segment._recaption_full_span)."""
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": [
+            {"type": "text", "text": SAME_CAPTION_QUESTION_TEMPLATE.format(caption_a=caption_a, caption_b=caption_b)},
+        ]},
+    ]
+    inputs = session.processor(conversation=conversation, return_tensors="pt")
+    inputs = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+    with torch.no_grad():
+        output_ids = session.model.generate(**inputs, max_new_tokens=20, do_sample=False)
+    response = session.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip().upper()
+    for choice in ("YES", "NO"):
+        if choice in response:
+            return choice
+    return None
+
+
 def classify_clip(
     session: VlmSession, start_t: float, end_t: float, question: str, choices: list[str],
     fps: float = LABEL_FPS, max_frames: int = LABEL_MAX_FRAMES, video_path: "str | None" = None,
