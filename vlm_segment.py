@@ -58,10 +58,18 @@ class ActionSegment:
     label: str
     start_t: float
     end_t: float
+    short_label: str = ""  # set by simplify_captions(); "" until then
 
     @property
     def duration_s(self) -> float:
         return self.end_t - self.start_t
+
+    @property
+    def merge_key(self) -> str:
+        """What merge_similar_neighbors compares: the simplified label if
+        available (shorter, more normalized -> more reliable text
+        comparison), else the full caption."""
+        return self.short_label or self.label
 
 
 def slide_windows(duration_s: float, window_s: float, step_s: float) -> list[tuple[float, float]]:
@@ -101,16 +109,49 @@ def _recaption_full_span(session: vlm_label.VlmSession, segments: list[ActionSeg
         )
 
 
+def simplify_captions(
+    session: vlm_label.VlmSession,
+    segments: list[ActionSegment],
+    progress_cb: Optional[Callable[[float, int, int], None]] = None,
+) -> None:
+    """Reduce each segment's full caption to a short action phrase (sets
+    `.short_label`), e.g. "The person is squatting down to pick up a box."
+    -> "squatting". Text-only, no video re-examined -- mainly a readability
+    aid; meant to run after recaptioning (segment_by_action already does
+    this) and before merge_similar_neighbors, which uses the short label
+    ONLY for a free exact-string-match short-circuit (see
+    ActionSegment.merge_key and the note in merge_similar_neighbors on why
+    it doesn't trust the model's judgment on short-label comparisons
+    beyond that)."""
+    n = len(segments)
+    for i, seg in enumerate(segments):
+        if progress_cb:
+            progress_cb((i + 1) / max(n, 1), i + 1, n)
+        seg.short_label = vlm_label.simplify_caption(session, seg.label)
+
+
 def merge_similar_neighbors(
     session: vlm_label.VlmSession,
     segments: list[ActionSegment],
     progress_cb: Optional[Callable[[float, int, int], None]] = None,
 ) -> list[ActionSegment]:
     """Second consolidation pass over already-divided, already-recaptioned
-    segments: walk neighbors in order and ask the VLM -- via a TEXT-only
-    comparison of the two segments' already-generated captions, not by
-    re-watching footage -- whether they describe the SAME action. A "yes"
-    merges them; a "no" keeps them separate.
+    segments: walk neighbors in order and decide if each pair is the SAME
+    action. Two tiers, cheapest/most-trustworthy first:
+      1. Exact match on `merge_key` (short label if simplify_captions() ran,
+         else the full caption) -> merge immediately, no VLM call.
+      2. Otherwise, ask the VLM via a TEXT-only comparison of the two
+         segments' FULL captions (never the short labels beyond tier 1 --
+         see the note below on why).
+    A "yes" merges them; a "no" keeps them separate.
+
+    Why tier 2 always uses the full caption, never the short label: testing
+    found the model's judgment on bare short-word comparisons is
+    unreliable even for genuine synonyms ("squatting" vs "crouching" ->
+    NO) and, worse, for literally identical short words ("assembling" vs
+    "assembling" -> NO, which is why tier 1's exact-match short-circuit
+    exists at all -- without it, identical short labels would get wrongly
+    split apart). The same model answers correctly on full sentences.
 
     Why compare captions instead of re-grounding in footage a second time
     (an earlier version of this function did that, the same way the divide
@@ -153,10 +194,24 @@ def merge_similar_neighbors(
 
         seg = segments[i]
         last = merged[-1]
-        answer = vlm_label.compare_captions(session, last.label, seg.label)
+
+        if last.merge_key.strip().lower() == seg.merge_key.strip().lower():
+            # Free win, no VLM call needed. Also sidesteps a real failure
+            # mode found by testing: compare_captions on bare short words
+            # (post-simplify_captions) is unreliable even for genuine
+            # synonyms ("squatting" vs "crouching" -> NO) and, worse, for
+            # LITERALLY IDENTICAL short words ("assembling" vs
+            # "assembling" -> NO). The model answers fine on full
+            # sentences; something about terse single-word "descriptions"
+            # specifically breaks the comparison. So: exact match on the
+            # short label short-circuits here; anything else falls back to
+            # comparing the full captions below, never the short labels.
+            answer = "YES"
+        else:
+            answer = vlm_label.compare_captions(session, last.label, seg.label)
 
         if answer == "YES":
-            merged[-1] = ActionSegment(label=last.label, start_t=last.start_t, end_t=seg.end_t)
+            merged[-1] = ActionSegment(label=last.label, start_t=last.start_t, end_t=seg.end_t, short_label=last.short_label)
             was_merged[-1] = True
         else:
             merged.append(seg)
@@ -165,6 +220,9 @@ def merge_similar_neighbors(
     to_recaption = [s for s, m in zip(merged, was_merged) if m]
     if to_recaption:
         _recaption_full_span(session, to_recaption)
+        # short_label is now stale for these (it reflects the pre-merge
+        # span's caption) -- refresh it against the new full-span caption.
+        simplify_captions(session, to_recaption)
 
     return merged
 

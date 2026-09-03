@@ -94,6 +94,43 @@ def load_session(video_path: str, video_duration_s: float, existing: "VlmSession
     )
 
 
+SIMPLIFY_QUESTION_TEMPLATE = (
+    'In 1-3 words, name the core physical action in this description, '
+    'stripped of any object or location detail. Description: "{caption}". '
+    'Answer with ONLY the short action phrase, nothing else.'
+)
+# NOTE: an earlier version of this prompt appended a list of quoted examples
+# (e.g. "'walking', 'squatting', 'standing', ..."), matching the pattern
+# that caused this 2B model to degenerate/echo in two earlier, unrelated
+# prompts (DEFAULT_QUESTION, the DWELL/MOVE constrained-vocab checks). This
+# text-to-text task didn't degenerate either way when tested, but the
+# example-free version also gave a MORE CORRECT answer on one case -- for a
+# caption about fastening a screw with a screwdriver, the examples version
+# extracted "screwdriver" (the tool, not the action); this version correctly
+# said "fastening". Keep it example-free.
+
+
+def simplify_caption(session: VlmSession, caption: str) -> str:
+    """Text-only (no video) reduction of an already-generated caption to a
+    short action phrase, e.g. "The person is squatting down to pick up a
+    box." -> "squatting". Meant to run after a segment's full caption is
+    already trusted (post-recaption), to produce a normalized label that's
+    both easier to read and more reliable to compare during the merge
+    pass (vlm_segment.merge_similar_neighbors) than the full sentence."""
+    conversation = [
+        {"role": "system", "content": "You are a helpful assistant."},
+        {"role": "user", "content": [
+            {"type": "text", "text": SIMPLIFY_QUESTION_TEMPLATE.format(caption=caption)},
+        ]},
+    ]
+    inputs = session.processor(conversation=conversation, return_tensors="pt")
+    inputs = {k: (v.cuda() if isinstance(v, torch.Tensor) else v) for k, v in inputs.items()}
+    with torch.no_grad():
+        output_ids = session.model.generate(**inputs, max_new_tokens=10, do_sample=False)
+    response = session.processor.batch_decode(output_ids, skip_special_tokens=True)[0].strip()
+    return response.strip(' .').lower()
+
+
 SAME_CAPTION_QUESTION_TEMPLATE = (
     'Do these two descriptions refer to the SAME physical action? '
     'A: "{caption_a}"  B: "{caption_b}" '

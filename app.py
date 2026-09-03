@@ -63,15 +63,19 @@ def _video_duration_s(video_path: str) -> float:
 def _build_outputs(video_path, segments, duration_s, out_dir_name):
     rows = []
     total_index = 0
+    has_short = any(s.short_label for s in segments)
     for i, s in enumerate(segments):
         index = mi.duration_to_index(s.duration_s)
         tmu = mi.index_to_tmu(index)
         total_index += index
-        rows.append({
+        row = {
             "Seq": i + 1, "Start (s)": round(s.start_t, 2), "End (s)": round(s.end_t, 2),
             "Duration (s)": round(s.duration_s, 2), "Action": s.label,
-            "Index": index, "TMU": round(tmu, 1), "Time (s)": round(mi.tmu_to_seconds(tmu), 3),
-        })
+        }
+        if has_short:
+            row["Simplified"] = s.short_label
+        row.update({"Index": index, "TMU": round(tmu, 1), "Time (s)": round(mi.tmu_to_seconds(tmu), 3)})
+        rows.append(row)
     df = pd.DataFrame(rows)
 
     total_tmu = mi.index_to_tmu(total_index)
@@ -112,8 +116,25 @@ def segment_fn(video_path, vlm_session, frames_per_window, step_frames, progress
         vlm_session, duration_s, int(frames_per_window), int(step_frames), progress_cb=cb,
     )
     summary, df, gallery_items = _build_outputs(video_path, segments, duration_s, "vlm_action_clips_step1")
-    summary += "\n\nNow run **2. Merge similar neighboring segments** if you want to consolidate over-split segments."
+    summary += "\n\nNow run **2. Simplify captions**, then **3. Merge similar neighboring segments**."
     return vlm_session, segments, summary, df, gallery_items
+
+
+def simplify_fn(video_path, vlm_session, segments, progress=gr.Progress()):
+    if not segments:
+        raise gr.Error("Run '1. Segment by VLM action recognition' first.")
+    if vlm_session is None:
+        raise gr.Error("VLM session missing — run step 1 again.")
+
+    duration_s = _video_duration_s(video_path)
+
+    def cb(frac, i, n):
+        progress(frac, desc=f"Simplifying caption {i}/{n}")
+
+    vlm_segment.simplify_captions(vlm_session, segments, progress_cb=cb)
+    summary, df, gallery_items = _build_outputs(video_path, segments, duration_s, "vlm_action_clips_step2")
+    summary += "\n\nNow run **3. Merge similar neighboring segments** — it'll compare the Simplified column above."
+    return segments, summary, df, gallery_items
 
 
 def merge_fn(video_path, vlm_session, segments, progress=gr.Progress()):
@@ -129,7 +150,7 @@ def merge_fn(video_path, vlm_session, segments, progress=gr.Progress()):
 
     merged = vlm_segment.merge_similar_neighbors(vlm_session, segments, progress_cb=cb)
     n_merged = len(segments) - len(merged)
-    summary, df, gallery_items = _build_outputs(video_path, merged, duration_s, "vlm_action_clips_step2")
+    summary, df, gallery_items = _build_outputs(video_path, merged, duration_s, "vlm_action_clips_step3")
     summary = (
         f"**Merged {n_merged} pair(s)** of neighboring segments judged the "
         f"same action ({len(segments)} → {len(merged)} segments).\n\n" + summary
@@ -167,18 +188,30 @@ METHODOLOGY_MD = """
    capability ceiling, not a prompt-wording problem — we tried several
    more elaborate prompts and they made it worse (the model either went
    silent or collapsed into repeating one fixed word for every window).
-6. **Merge pass (optional, step 2)**: steps 1-5 can still over-segment —
-   the tiny comparison windows in step 3 are tuned to be sensitive to
-   change, so two adjacent segments can end up split even when a human
-   would call them the same action. This pass compares each neighboring
-   pair's *already-generated captions* directly, as plain text, no video
-   involved — cheaper than, and for low-motion/ambiguous footage more
-   reliable than, re-examining clips a second time (an earlier version did
-   that and gave inconsistent verdicts on nearly-static content). It only
-   ever merges *adjacent* segments; a repeated action with something
-   different sandwiched between two occurrences stays separate, since
-   merging means extending one contiguous time range and bridging a gap
-   would misrepresent what's actually in between.
+6. **Simplify pass (optional, step 2)**: text-only reduction of each
+   segment's full caption to a short action phrase (e.g. "The person is
+   squatting down to pick up a box." → "squatting"), stored separately as
+   `short_label` — the full caption isn't discarded. Purely a readability
+   aid on its own, but step 7 prefers this shorter, more normalized label
+   for comparison when it's available, since two paraphrases of the same
+   action ("squatting" vs "crouching down") are more reliably judged equal
+   as short phrases than as full sentences with more room for divergent
+   wording.
+7. **Merge pass (optional, step 3)**: steps 1-5 can still over-segment —
+   the tiny comparison windows in step 3 [of the divide algorithm] are
+   tuned to be sensitive to change, so two adjacent segments can end up
+   split even when a human would call them the same action. This pass
+   compares each neighboring pair's labels (the simplified one if step 6
+   ran, else the full caption) directly, as plain text, no video involved
+   — cheaper than, and for low-motion/ambiguous footage more reliable
+   than, re-examining clips a second time (an earlier version did that and
+   gave inconsistent verdicts on nearly-static content — two IDENTICAL
+   captions of someone standing still were judged "different" when the
+   model was asked to re-compare via footage). It only ever merges
+   *adjacent* segments; a repeated action with something different
+   sandwiched between two occurrences stays separate, since merging means
+   extending one contiguous time range and bridging a gap would
+   misrepresent what's actually in between.
 
 ## What this is not
 
@@ -239,15 +272,24 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
                     "different video reuse the loaded model and only "
                     "regenerate the small resized copies._"
                 )
-                merge_btn = gr.Button("2. Merge similar neighboring segments")
+                simplify_btn = gr.Button("2. Simplify captions")
                 gr.Markdown(
-                    "_Second pass: for each pair of neighboring segments, "
-                    "asks the model — via a text-only comparison of their "
-                    "already-generated captions, no video re-examined — "
-                    "whether they describe the same action. Only merges "
-                    "adjacent segments: a repeated action with something "
-                    "different in between stays separate rather than "
-                    "wrongly bridging the gap between them._"
+                    "_Text-only reduction of each segment's full caption to "
+                    "a short action phrase, e.g. \"The person is squatting "
+                    "down to pick up a box.\" → \"squatting\" (see the new "
+                    "Simplified column). No video re-examined. Optional, "
+                    "but step 3 compares this shorter, more normalized "
+                    "label when it's available — usually a more reliable "
+                    "text comparison than the full sentence._"
+                )
+                merge_btn = gr.Button("3. Merge similar neighboring segments")
+                gr.Markdown(
+                    "_Compares each pair of neighboring segments' labels "
+                    "(Simplified if step 2 was run, else the full caption) "
+                    "as text — no video re-examined. Only merges adjacent "
+                    "segments: a repeated action with something different "
+                    "in between stays separate rather than wrongly bridging "
+                    "the gap between them._"
                 )
             with gr.Column(scale=2):
                 summary_md = gr.Markdown()
@@ -266,6 +308,12 @@ with gr.Blocks(title="VLM Action Segmentation") as demo:
         segment_fn,
         inputs=[video_in, vlm_state, frames_per_window_slider, step_frames_slider],
         outputs=[vlm_state, segments_state, summary_md, segments_df, clips_gallery],
+    )
+
+    simplify_btn.click(
+        simplify_fn,
+        inputs=[video_in, vlm_state, segments_state],
+        outputs=[segments_state, summary_md, segments_df, clips_gallery],
     )
 
     merge_btn.click(
